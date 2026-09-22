@@ -12,11 +12,11 @@ function resolveMalaysia(text){
  for(const name of Object.keys(STATES).sort((a,b)=>b.length-a.length)){const escaped=name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");if(new RegExp(`(^|\\W)${escaped}(?=$|\\W)`,"i").test(low)){resolved.state_code=STATES[name];break;}}
  for(const name of Object.keys(PAYMENTS).sort((a,b)=>b.length-a.length)){if(low.includes(name)){resolved.payment_mode=PAYMENTS[name];break;}}
  for(const name of Object.keys(DOCUMENTS).sort((a,b)=>b.length-a.length)){if(low.includes(name)){resolved.document_type=DOCUMENTS[name];break;}}
- return {resolved,warnings,machine_ready:resolved.amount!==undefined&&resolved.currency==="MYR"};
+ return {resolved,warnings,machine_ready:resolved.amount!==undefined&&resolved.currency==="MYR"&&!ambiguous};
 }
 export default{async fetch(request){const url=new URL(request.url);
- if(request.method==="GET"&&url.pathname==="/health")return Response.json({ok:true,service:"MYReady",version:"0.5"});
- if(request.method!=="POST"||url.pathname!=="/v1/malaysia/resolve")return Response.json({service:"MYReady",version:"0.5",status:"online",endpoints:{health:"GET /health",resolve:"POST /v1/malaysia/resolve"}},{status:404});
+ if(request.method==="GET"&&url.pathname==="/health")return Response.json({ok:true,service:"MYReady",version:"0.6"});
+ if(request.method!=="POST"||url.pathname!=="/v1/malaysia/resolve")return Response.json({service:"MYReady",version:"0.6",status:"online",endpoints:{health:"GET /health",resolve:"POST /v1/malaysia/resolve"}},{status:404});
  let body;try{body=await request.json();}catch{return Response.json({error:"invalid_json"},{status:400});}
  if(typeof body.text!=="string"||!body.text.trim())return Response.json({error:"text_required"},{status:422});
  if(body.text.length>5000)return Response.json({error:"text_too_long"},{status:413});
