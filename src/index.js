@@ -1,4 +1,5 @@
-const VERSION = "0.7";
+const VERSION = "0.8";
+const UNIT_PRICE = Object.freeze({ currency: "MYR", amount_minor: 1, amount: 0.01 });
 
 const STATES = {
   johor: "01", kedah: "02", kelantan: "03", melaka: "04", malacca: "04",
@@ -135,6 +136,30 @@ export function resolveMalaysia(text) {
   return response;
 }
 
+function isValidIdempotencyKey(value) {
+  return value === null || /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+}
+
+async function createOperationId(text, idempotencyKey) {
+  if (!idempotencyKey) return crypto.randomUUID();
+  const bytes = new TextEncoder().encode(`myready:v1:resolve:${idempotencyKey}:${text}`);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function attachUsage(result, operationId, idempotent) {
+  return {
+    ...result,
+    usage: {
+      operation_id: operationId,
+      idempotent,
+      chargeable: result.machine_ready,
+      unit_price: UNIT_PRICE,
+      charge_status: "not_collected",
+    },
+  };
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -158,6 +183,18 @@ export default {
       return Response.json({ error: "text_required" }, { status: 422 });
     }
     if (body.text.length > 5000) return Response.json({ error: "text_too_long" }, { status: 413 });
-    return Response.json(resolveMalaysia(body.text));
+    const idempotencyKey = request.headers.get("Idempotency-Key");
+    if (!isValidIdempotencyKey(idempotencyKey)) {
+      return Response.json({ error: "invalid_idempotency_key" }, { status: 400 });
+    }
+    const operationId = await createOperationId(body.text, idempotencyKey);
+    const result = attachUsage(resolveMalaysia(body.text), operationId, idempotencyKey !== null);
+    return Response.json(result, {
+      headers: {
+        "X-MYReady-Operation-Id": operationId,
+        "X-MYReady-Chargeable": String(result.usage.chargeable),
+        "X-MYReady-Unit-Price": "MYR 0.01",
+      },
+    });
   },
 };

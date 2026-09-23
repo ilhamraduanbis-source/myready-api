@@ -72,8 +72,53 @@ test("worker validates request body and size", async () => {
   assert.equal(response.status, 413);
 });
 
-test("health identifies v0.7", async () => {
+test("health identifies v0.8", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"));
   assert.equal(response.status, 200);
-  assert.equal((await response.json()).version, "0.7");
+  assert.equal((await response.json()).version, "0.8");
+});
+
+test("successful operations expose the explicit one-cent unit price", async () => {
+  const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "invoice-123" },
+    body: JSON.stringify({ text: "Jumlah RM10 di Selangor" }),
+  }));
+  const body = await response.json();
+  assert.equal(body.usage.chargeable, true);
+  assert.equal(body.usage.charge_status, "not_collected");
+  assert.deepEqual(body.usage.unit_price, { currency: "MYR", amount_minor: 1, amount: 0.01 });
+  assert.equal(body.usage.idempotent, true);
+  assert.equal(response.headers.get("X-MYReady-Unit-Price"), "MYR 0.01");
+});
+
+test("the same idempotency key and input produce the same operation id", async () => {
+  const request = () => new Request("https://example.test/v1/malaysia/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "stable-key" },
+    body: JSON.stringify({ text: "RM25" }),
+  });
+  const first = await (await worker.fetch(request())).json();
+  const second = await (await worker.fetch(request())).json();
+  assert.equal(first.usage.operation_id, second.usage.operation_id);
+});
+
+test("ambiguous operations are not chargeable", async () => {
+  const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "ambiguous-1" },
+    body: JSON.stringify({ text: "RM10 atau RM20" }),
+  }));
+  const body = await response.json();
+  assert.equal(body.usage.chargeable, false);
+});
+
+test("invalid idempotency keys are rejected", async () => {
+  const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "contains spaces" },
+    body: JSON.stringify({ text: "RM10" }),
+  }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "invalid_idempotency_key" });
 });
