@@ -72,10 +72,10 @@ test("worker validates request body and size", async () => {
   assert.equal(response.status, 413);
 });
 
-test("health identifies v0.8", async () => {
+test("health identifies v0.9", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"));
   assert.equal(response.status, 200);
-  assert.equal((await response.json()).version, "0.8");
+  assert.equal((await response.json()).version, "0.9");
 });
 
 test("successful operations expose the explicit one-cent unit price", async () => {
@@ -121,4 +121,51 @@ test("invalid idempotency keys are rejected", async () => {
   }));
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "invalid_idempotency_key" });
+});
+
+test("chargeable operations are recorded without storing source text", async () => {
+  const statements = [];
+  const LEDGER = {
+    prepare(sql) {
+      const statement = { sql, values: [] };
+      statements.push(statement);
+      return {
+        bind(...values) {
+          statement.values = values;
+          return this;
+        },
+        async run() {
+          return { meta: { changes: sql.includes("INSERT OR IGNORE") ? 1 : 0 } };
+        },
+      };
+    },
+  };
+  const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "ledger-test" },
+    body: JSON.stringify({ text: "Sensitive invoice text RM10" }),
+  }), { LEDGER });
+  const body = await response.json();
+  assert.equal(body.usage.charge_status, "recorded_not_collected");
+  assert.deepEqual(body.usage.ledger, { recorded: true, duplicate: false });
+  assert.equal(statements.length, 2);
+  assert.equal(JSON.stringify(statements).includes("Sensitive invoice text"), false);
+});
+
+test("ledger identifies an already-recorded operation", async () => {
+  const LEDGER = {
+    prepare(sql) {
+      return {
+        bind() { return this; },
+        async run() { return { meta: { changes: 0 } }; },
+      };
+    },
+  };
+  const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "duplicate-test" },
+    body: JSON.stringify({ text: "RM10" }),
+  }), { LEDGER });
+  const body = await response.json();
+  assert.equal(body.usage.ledger.duplicate, true);
 });

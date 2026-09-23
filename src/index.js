@@ -1,4 +1,4 @@
-const VERSION = "0.8";
+const VERSION = "0.9";
 const UNIT_PRICE = Object.freeze({ currency: "MYR", amount_minor: 1, amount: 0.01 });
 
 const STATES = {
@@ -160,8 +160,46 @@ function attachUsage(result, operationId, idempotent) {
   };
 }
 
+async function recordChargeableOperation(env, usage) {
+  if (!usage.chargeable || !env?.LEDGER) return usage;
+
+  await env.LEDGER.prepare(`
+    CREATE TABLE IF NOT EXISTS operations (
+      operation_id TEXT PRIMARY KEY,
+      endpoint TEXT NOT NULL,
+      idempotent INTEGER NOT NULL,
+      currency TEXT NOT NULL,
+      amount_minor INTEGER NOT NULL CHECK (amount_minor = 1),
+      created_at TEXT NOT NULL
+    )
+  `).run();
+
+  const insertion = await env.LEDGER.prepare(`
+    INSERT OR IGNORE INTO operations
+      (operation_id, endpoint, idempotent, currency, amount_minor, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(
+    usage.operation_id,
+    "/v1/malaysia/resolve",
+    usage.idempotent ? 1 : 0,
+    usage.unit_price.currency,
+    usage.unit_price.amount_minor,
+    new Date().toISOString(),
+  ).run();
+
+  const newlyRecorded = insertion.meta?.changes === 1;
+  return {
+    ...usage,
+    charge_status: "recorded_not_collected",
+    ledger: {
+      recorded: true,
+      duplicate: !newlyRecorded,
+    },
+  };
+}
+
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ ok: true, service: "MYReady", version: VERSION });
@@ -189,6 +227,7 @@ export default {
     }
     const operationId = await createOperationId(body.text, idempotencyKey);
     const result = attachUsage(resolveMalaysia(body.text), operationId, idempotencyKey !== null);
+    result.usage = await recordChargeableOperation(env, result.usage);
     return Response.json(result, {
       headers: {
         "X-MYReady-Operation-Id": operationId,
