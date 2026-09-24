@@ -327,8 +327,50 @@ function attachUsage(result, operationId, idempotent) {
       chargeable: result.machine_ready,
       unit_price: UNIT_PRICE,
       charge_status: "not_collected",
+      economic_mode: "simulated_value_only",
+      cash_collected: false,
     },
   };
+}
+
+function pilotClientId(request) {
+  const value = request.headers.get("X-MYReady-Pilot-Client");
+  if (value === null) return "unattributed";
+  return /^[A-Za-z0-9._:-]{1,64}$/.test(value) ? value : null;
+}
+
+async function recordPilotEvent(env, event) {
+  if (!env?.LEDGER) return;
+  try {
+    await env.LEDGER.prepare(`
+      CREATE TABLE IF NOT EXISTS pilot_events (
+        event_id TEXT PRIMARY KEY,
+        pilot_client_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        reason_codes TEXT NOT NULL,
+        chargeable INTEGER NOT NULL,
+        duplicate INTEGER NOT NULL,
+        idempotent INTEGER NOT NULL,
+        simulated_amount_minor INTEGER NOT NULL,
+        latency_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `).run();
+    await env.LEDGER.prepare(`
+      INSERT INTO pilot_events
+        (event_id, pilot_client_id, endpoint, outcome, reason_codes, chargeable, duplicate, idempotent, simulated_amount_minor, latency_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(), event.pilotClientId, event.endpoint, event.outcome,
+      JSON.stringify([...new Set(event.reasonCodes)]), event.usage.chargeable ? 1 : 0,
+      event.usage.ledger?.duplicate ? 1 : 0, event.usage.idempotent ? 1 : 0,
+      event.usage.chargeable && !event.usage.ledger?.duplicate ? 1 : 0,
+      Math.max(0, Math.round(event.latencyMs)), new Date().toISOString(),
+    ).run();
+  } catch {
+    // Pilot telemetry must never make the validation endpoint unavailable.
+  }
 }
 
 async function recordChargeableOperation(env, usage, endpoint = "/v1/malaysia/resolve") {
@@ -371,6 +413,7 @@ async function recordChargeableOperation(env, usage, endpoint = "/v1/malaysia/re
 
 export default {
   async fetch(request, env) {
+    const startedAt = performance.now();
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ ok: true, service: "MYReady", version: VERSION });
@@ -387,10 +430,20 @@ export default {
       if (JSON.stringify(body).length > 100_000) return Response.json({ error: "payload_too_large" }, { status: 413 });
       const idempotencyKey = request.headers.get("Idempotency-Key");
       if (!isValidIdempotencyKey(idempotencyKey)) return Response.json({ error: "invalid_idempotency_key" }, { status: 400 });
+      const clientId = pilotClientId(request);
+      if (clientId === null) return Response.json({ error: "invalid_pilot_client_id" }, { status: 400 });
       const operationId = await createPreflightOperationId(body.document, idempotencyKey);
       const preflight = preflightMyInvois(body.document);
       const result = attachUsage({ ...preflight, machine_ready: preflight.ready }, operationId, idempotencyKey !== null);
       result.usage = await recordChargeableOperation(env, result.usage, "/v1/myinvois/preflight");
+      await recordPilotEvent(env, {
+        pilotClientId: clientId,
+        endpoint: "/v1/myinvois/preflight",
+        outcome: preflight.status,
+        reasonCodes: [...preflight.errors, ...preflight.warnings].map(({ code }) => code),
+        usage: result.usage,
+        latencyMs: performance.now() - startedAt,
+      });
       return Response.json(result, {
         headers: {
           "X-MYReady-Operation-Id": operationId,
@@ -420,9 +473,19 @@ export default {
     if (!isValidIdempotencyKey(idempotencyKey)) {
       return Response.json({ error: "invalid_idempotency_key" }, { status: 400 });
     }
+    const clientId = pilotClientId(request);
+    if (clientId === null) return Response.json({ error: "invalid_pilot_client_id" }, { status: 400 });
     const operationId = await createOperationId(body.text, idempotencyKey);
     const result = attachUsage(resolveMalaysia(body.text), operationId, idempotencyKey !== null);
     result.usage = await recordChargeableOperation(env, result.usage);
+    await recordPilotEvent(env, {
+      pilotClientId: clientId,
+      endpoint: "/v1/malaysia/resolve",
+      outcome: result.machine_ready ? "ready" : "rejected",
+      reasonCodes: Object.keys(result.ambiguities || {}).map((name) => `ambiguous_${name}`),
+      usage: result.usage,
+      latencyMs: performance.now() - startedAt,
+    });
     return Response.json(result, {
       headers: {
         "X-MYReady-Operation-Id": operationId,

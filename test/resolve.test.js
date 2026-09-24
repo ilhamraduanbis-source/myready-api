@@ -183,6 +183,8 @@ test("MyInvois preflight ledger stores endpoint but not invoice contents", async
   }), { LEDGER });
   const body = await response.json();
   assert.equal(body.usage.charge_status, "recorded_not_collected");
+  assert.equal(body.usage.economic_mode, "simulated_value_only");
+  assert.equal(body.usage.cash_collected, false);
   assert.equal(JSON.stringify(statements).includes("/v1/myinvois/preflight"), true);
   assert.equal(JSON.stringify(statements).includes("PRIVATE-INVOICE-SECRET"), false);
 });
@@ -265,8 +267,40 @@ test("chargeable operations are recorded without storing source text", async () 
   const body = await response.json();
   assert.equal(body.usage.charge_status, "recorded_not_collected");
   assert.deepEqual(body.usage.ledger, { recorded: true, duplicate: false });
-  assert.equal(statements.length, 2);
+  assert.equal(statements.length, 4);
   assert.equal(JSON.stringify(statements).includes("Sensitive invoice text"), false);
+});
+
+test("pilot telemetry stores aggregate categories without request contents", async () => {
+  const statements = [];
+  const LEDGER = {
+    prepare(sql) {
+      const statement = { sql, values: [] };
+      statements.push(statement);
+      return { bind(...values) { statement.values = values; return this; }, async run() { return { meta: { changes: sql.includes("INSERT OR IGNORE") ? 1 : 0 } }; } };
+    },
+  };
+  const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "pilot-metrics-1", "X-MYReady-Pilot-Client": "pilot-alpha" },
+    body: JSON.stringify({ document: validInvoice() }),
+  }), { LEDGER });
+  assert.equal(response.status, 200);
+  const serialized = JSON.stringify(statements);
+  assert.equal(serialized.includes("pilot-alpha"), true);
+  assert.equal(serialized.includes("not_authoritatively_verified"), true);
+  assert.equal(serialized.includes("Supplier Sdn Bhd"), false);
+  assert.equal(serialized.includes("202601234567"), false);
+});
+
+test("invalid pilot client identifiers are rejected", async () => {
+  const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-MYReady-Pilot-Client": "contains spaces" },
+    body: JSON.stringify({ document: validInvoice() }),
+  }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "invalid_pilot_client_id" });
 });
 
 test("ledger identifies an already-recorded operation", async () => {

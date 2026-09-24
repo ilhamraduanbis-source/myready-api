@@ -1,0 +1,149 @@
+openapi: 3.1.0
+info:
+  title: MYReady API
+  version: 1.0.1
+  description: Local Malaysian data preflight. Not an official HASiL or MyInvois service.
+servers:
+  - url: https://myready-api.ilhamraduan-bis.workers.dev
+paths:
+  /health:
+    get:
+      summary: Check service health
+      responses:
+        "200":
+          description: Healthy service
+  /v1/myinvois/preflight:
+    post:
+      summary: Run local MyInvois-oriented preflight checks
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9._:-]{1,128}$"
+        - in: header
+          name: X-MYReady-Pilot-Client
+          required: false
+          description: Opaque identifier assigned to a pilot team.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9._:-]{1,64}$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [document]
+              properties:
+                document:
+                  $ref: "#/components/schemas/CompactInvoice"
+      responses:
+        "200":
+          description: Preflight completed. Inspect status, ready, errors and warnings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreflightResult"
+        "400":
+          description: Invalid JSON or header
+        "413":
+          description: Payload exceeds 100 KB
+components:
+  schemas:
+    Address:
+      type: object
+      required: [line, city, postcode, state_code, country_code]
+      properties:
+        line: { type: string }
+        city: { type: string }
+        postcode: { type: string }
+        state_code: { type: string }
+        country_code: { type: string, pattern: "^[A-Z]{3}$" }
+    Party:
+      type: object
+      required: [tin, id_type, id_value, name, address]
+      properties:
+        tin: { type: string }
+        id_type: { type: string, enum: [BRN, NRIC, PASSPORT, ARMY] }
+        id_value: { type: string }
+        name: { type: string }
+        phone: { type: string }
+        email: { type: string, format: email }
+        address: { $ref: "#/components/schemas/Address" }
+    InvoiceLine:
+      type: object
+      required: [description, classification_code, tax_type, quantity, unit_price, line_total]
+      properties:
+        description: { type: string }
+        classification_code: { type: string, pattern: "^0(?:0[1-9]|[1-3][0-9]|4[0-5])$" }
+        tax_type: { type: string, enum: ["01", "02", "03", "04", "05", "06", E] }
+        quantity: { type: number, exclusiveMinimum: 0 }
+        unit_price: { type: number, minimum: 0 }
+        line_total: { type: number, minimum: 0 }
+    Totals:
+      type: object
+      required: [subtotal, tax, total]
+      properties:
+        subtotal: { type: number, minimum: 0 }
+        tax: { type: number, minimum: 0 }
+        total: { type: number, minimum: 0 }
+    CompactInvoice:
+      type: object
+      required:
+        - e_invoice_version
+        - document_type_code
+        - invoice_number
+        - issue_date
+        - issue_time
+        - currency
+        - supplier
+        - buyer
+        - lines
+        - totals
+      properties:
+        e_invoice_version: { type: string, enum: ["1.0", "1.1"] }
+        document_type_code: { type: string, enum: ["01", "02", "03", "04", "11", "12", "13", "14"] }
+        invoice_number: { type: string, maxLength: 50 }
+        issue_date: { type: string, format: date }
+        issue_time: { type: string, pattern: "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\dZ$" }
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        exchange_rate: { type: number, exclusiveMinimum: 0 }
+        payment_mode: { type: string, enum: ["01", "02", "03", "04", "05", "06", "07", "08"] }
+        supplier: { $ref: "#/components/schemas/Party" }
+        buyer: { $ref: "#/components/schemas/Party" }
+        lines:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/InvoiceLine" }
+        totals: { $ref: "#/components/schemas/Totals" }
+    Issue:
+      type: object
+      required: [path, code, message]
+      properties:
+        path: { type: string }
+        code: { type: string }
+        message: { type: string }
+    PreflightResult:
+      type: object
+      required: [status, ready, validation_scope, errors, warnings, machine_ready, usage]
+      properties:
+        status: { type: string, enum: [ready, needs_review, rejected] }
+        ready: { type: boolean }
+        validation_scope: { const: local_preflight_not_authoritative_myinvois_validation }
+        errors:
+          type: array
+          items: { $ref: "#/components/schemas/Issue" }
+        warnings:
+          type: array
+          items: { $ref: "#/components/schemas/Issue" }
+        machine_ready: { type: boolean }
+        usage:
+          type: object
+          properties:
+            operation_id: { type: string }
+            idempotent: { type: boolean }
+            chargeable: { type: boolean, description: Qualifies for simulated value; not a real charge during pilot. }
+            economic_mode: { const: simulated_value_only }
+            cash_collected: { const: false }
