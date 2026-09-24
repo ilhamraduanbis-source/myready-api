@@ -14,9 +14,53 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run regression tests
         run: npm test
+      - name: Generate temporary masked smoke-test token
+        run: |
+          PILOT_TOKEN="myr_pilot_$(openssl rand -hex 32)"
+          echo "::add-mask::$PILOT_TOKEN"
+          PILOT_TOKEN_HASH="$(printf '%s' "$PILOT_TOKEN" | sha256sum | cut -d' ' -f1)"
+          echo "PILOT_TOKEN=$PILOT_TOKEN" >> "$GITHUB_ENV"
+          echo "PILOT_TOKEN_HASH=$PILOT_TOKEN_HASH" >> "$GITHUB_ENV"
+      - name: Apply pilot security schema
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute myready-api-ledger --remote --file=migrations/0002_pilot_security.sql
+      - name: Provision temporary smoke-test participant
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >-
+            d1 execute myready-api-ledger --remote --command
+            "INSERT OR REPLACE INTO pilot_participants
+            (participant_id, token_hash, status, rate_limit_per_minute, created_at, revoked_at)
+            VALUES ('internal-readiness', '${{ env.PILOT_TOKEN_HASH }}', 'active', 10, datetime('now'), NULL)"
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
+      - name: Verify authenticated production preflight
+        run: |
+          RESPONSE="$(curl --fail-with-body --silent --show-error --max-time 20 \
+            -X POST 'https://myready-api.ilhamraduan-bis.workers.dev/v1/myinvois/preflight' \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $PILOT_TOKEN" \
+            -H 'Idempotency-Key: ci-production-readiness' \
+            --data-binary @test/fixtures/valid-preflight.json)"
+          printf '%s' "$RESPONSE" | jq -e \
+            '.ready == true and .usage.economic_mode == "simulated_value_only" and .usage.cash_collected == false and .usage.simulated_value_eligible == true and (.usage | has("chargeable") | not)' \
+            >/dev/null
+      - name: Revoke temporary smoke-test participant
+        if: always()
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >-
+            d1 execute myready-api-ledger --remote --command
+            "UPDATE pilot_participants SET status = 'revoked', revoked_at = datetime('now')
+            WHERE participant_id = 'internal-readiness' AND token_hash = '${{ env.PILOT_TOKEN_HASH }}'"

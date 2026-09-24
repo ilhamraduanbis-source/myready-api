@@ -1,5 +1,6 @@
 const VERSION = "1.0";
-const UNIT_PRICE = Object.freeze({ currency: "MYR", amount_minor: 1, amount: 0.01 });
+const SIMULATED_UNIT_VALUE = Object.freeze({ currency: "MYR", amount_minor: 1, amount: 0.01 });
+const DEFAULT_PILOT_RATE_LIMIT = 60;
 
 const STATES = {
   johor: "01", kedah: "02", kelantan: "03", melaka: "04", malacca: "04",
@@ -324,32 +325,91 @@ function attachUsage(result, operationId, idempotent) {
     usage: {
       operation_id: operationId,
       idempotent,
-      chargeable: result.machine_ready,
-      unit_price: UNIT_PRICE,
-      charge_status: "not_collected",
+      simulated_value_eligible: result.machine_ready,
+      simulated_unit_value: SIMULATED_UNIT_VALUE,
+      simulated_value_status: "not_recorded",
       economic_mode: "simulated_value_only",
       cash_collected: false,
     },
   };
 }
 
-function pilotClientId(request) {
-  const value = request.headers.get("X-MYReady-Pilot-Client");
-  if (value === null) return "unattributed";
-  return /^[A-Za-z0-9._:-]{1,64}$/.test(value) ? value : null;
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function ensurePilotSecurityTables(database) {
+  await database.prepare(`
+    CREATE TABLE IF NOT EXISTS pilot_participants (
+      participant_id TEXT PRIMARY KEY,
+      token_hash TEXT UNIQUE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+      rate_limit_per_minute INTEGER NOT NULL DEFAULT 60 CHECK (rate_limit_per_minute BETWEEN 1 AND 600),
+      created_at TEXT NOT NULL,
+      revoked_at TEXT
+    )
+  `).run();
+  await database.prepare(`
+    CREATE TABLE IF NOT EXISTS pilot_rate_limits (
+      participant_id TEXT NOT NULL,
+      window_start INTEGER NOT NULL,
+      request_count INTEGER NOT NULL,
+      PRIMARY KEY (participant_id, window_start)
+    )
+  `).run();
+}
+
+function bearerToken(request) {
+  const authorization = request.headers.get("Authorization");
+  if (!authorization) return null;
+  const match = authorization.match(/^Bearer (myr_pilot_[A-Za-z0-9_-]{32,128})$/);
+  return match?.[1] || null;
+}
+
+async function authorizePilot(request, env, now = Date.now()) {
+  const token = bearerToken(request);
+  if (!token || !env?.LEDGER) return { ok: false, status: 401, error: "invalid_pilot_token" };
+
+  await ensurePilotSecurityTables(env.LEDGER);
+  const tokenHash = await sha256Hex(token);
+  const participant = await env.LEDGER.prepare(`
+    SELECT participant_id, rate_limit_per_minute
+    FROM pilot_participants
+    WHERE token_hash = ? AND status = 'active' AND revoked_at IS NULL
+  `).bind(tokenHash).first();
+  if (!participant) return { ok: false, status: 401, error: "invalid_pilot_token" };
+
+  const windowStart = Math.floor(now / 60_000) * 60;
+  await env.LEDGER.prepare(`
+    INSERT INTO pilot_rate_limits (participant_id, window_start, request_count)
+    VALUES (?, ?, 1)
+    ON CONFLICT(participant_id, window_start)
+    DO UPDATE SET request_count = request_count + 1
+  `).bind(participant.participant_id, windowStart).run();
+  const bucket = await env.LEDGER.prepare(`
+    SELECT request_count FROM pilot_rate_limits
+    WHERE participant_id = ? AND window_start = ?
+  `).bind(participant.participant_id, windowStart).first();
+  const limit = Number(participant.rate_limit_per_minute) || DEFAULT_PILOT_RATE_LIMIT;
+  const remaining = Math.max(0, limit - Number(bucket?.request_count || 1));
+  if (Number(bucket?.request_count || 1) > limit) {
+    return { ok: false, status: 429, error: "rate_limit_exceeded", limit, remaining, retryAfter: 60 - (Math.floor(now / 1000) % 60) };
+  }
+  return { ok: true, participantId: participant.participant_id, limit, remaining };
 }
 
 async function recordPilotEvent(env, event) {
   if (!env?.LEDGER) return;
   try {
     await env.LEDGER.prepare(`
-      CREATE TABLE IF NOT EXISTS pilot_events (
+      CREATE TABLE IF NOT EXISTS pilot_events_v2 (
         event_id TEXT PRIMARY KEY,
-        pilot_client_id TEXT NOT NULL,
+        participant_id TEXT NOT NULL,
         endpoint TEXT NOT NULL,
         outcome TEXT NOT NULL,
         reason_codes TEXT NOT NULL,
-        chargeable INTEGER NOT NULL,
+        simulated_value_eligible INTEGER NOT NULL,
         duplicate INTEGER NOT NULL,
         idempotent INTEGER NOT NULL,
         simulated_amount_minor INTEGER NOT NULL,
@@ -358,14 +418,14 @@ async function recordPilotEvent(env, event) {
       )
     `).run();
     await env.LEDGER.prepare(`
-      INSERT INTO pilot_events
-        (event_id, pilot_client_id, endpoint, outcome, reason_codes, chargeable, duplicate, idempotent, simulated_amount_minor, latency_ms, created_at)
+      INSERT INTO pilot_events_v2
+        (event_id, participant_id, endpoint, outcome, reason_codes, simulated_value_eligible, duplicate, idempotent, simulated_amount_minor, latency_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       crypto.randomUUID(), event.pilotClientId, event.endpoint, event.outcome,
-      JSON.stringify([...new Set(event.reasonCodes)]), event.usage.chargeable ? 1 : 0,
+      JSON.stringify([...new Set(event.reasonCodes)]), event.usage.simulated_value_eligible ? 1 : 0,
       event.usage.ledger?.duplicate ? 1 : 0, event.usage.idempotent ? 1 : 0,
-      event.usage.chargeable && !event.usage.ledger?.duplicate ? 1 : 0,
+      event.usage.simulated_value_eligible && !event.usage.ledger?.duplicate ? 1 : 0,
       Math.max(0, Math.round(event.latencyMs)), new Date().toISOString(),
     ).run();
   } catch {
@@ -373,8 +433,8 @@ async function recordPilotEvent(env, event) {
   }
 }
 
-async function recordChargeableOperation(env, usage, endpoint = "/v1/malaysia/resolve") {
-  if (!usage.chargeable || !env?.LEDGER) return usage;
+async function recordSimulatedValueOperation(env, usage, endpoint = "/v1/malaysia/resolve") {
+  if (!usage.simulated_value_eligible || !env?.LEDGER) return usage;
 
   await env.LEDGER.prepare(`
     CREATE TABLE IF NOT EXISTS operations (
@@ -395,15 +455,15 @@ async function recordChargeableOperation(env, usage, endpoint = "/v1/malaysia/re
     usage.operation_id,
     endpoint,
     usage.idempotent ? 1 : 0,
-    usage.unit_price.currency,
-    usage.unit_price.amount_minor,
+    usage.simulated_unit_value.currency,
+    usage.simulated_unit_value.amount_minor,
     new Date().toISOString(),
   ).run();
 
   const newlyRecorded = insertion.meta?.changes === 1;
   return {
     ...usage,
-    charge_status: "recorded_not_collected",
+    simulated_value_status: "recorded_simulation_only",
     ledger: {
       recorded: true,
       duplicate: !newlyRecorded,
@@ -419,6 +479,17 @@ export default {
       return Response.json({ ok: true, service: "MYReady", version: VERSION });
     }
     if (request.method === "POST" && url.pathname === "/v1/myinvois/preflight") {
+      let authorization;
+      try {
+        authorization = await authorizePilot(request, env);
+      } catch {
+        return Response.json({ error: "pilot_authentication_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+      }
+      if (!authorization.ok) {
+        const headers = { "Cache-Control": "no-store" };
+        if (authorization.retryAfter) headers["Retry-After"] = String(authorization.retryAfter);
+        return Response.json({ error: authorization.error }, { status: authorization.status, headers });
+      }
       const declaredLength = Number(request.headers.get("content-length") || 0);
       if (declaredLength > 100_000) return Response.json({ error: "payload_too_large" }, { status: 413 });
       let body;
@@ -430,14 +501,12 @@ export default {
       if (JSON.stringify(body).length > 100_000) return Response.json({ error: "payload_too_large" }, { status: 413 });
       const idempotencyKey = request.headers.get("Idempotency-Key");
       if (!isValidIdempotencyKey(idempotencyKey)) return Response.json({ error: "invalid_idempotency_key" }, { status: 400 });
-      const clientId = pilotClientId(request);
-      if (clientId === null) return Response.json({ error: "invalid_pilot_client_id" }, { status: 400 });
       const operationId = await createPreflightOperationId(body.document, idempotencyKey);
       const preflight = preflightMyInvois(body.document);
       const result = attachUsage({ ...preflight, machine_ready: preflight.ready }, operationId, idempotencyKey !== null);
-      result.usage = await recordChargeableOperation(env, result.usage, "/v1/myinvois/preflight");
+      result.usage = await recordSimulatedValueOperation(env, result.usage, "/v1/myinvois/preflight");
       await recordPilotEvent(env, {
-        pilotClientId: clientId,
+        pilotClientId: authorization.participantId,
         endpoint: "/v1/myinvois/preflight",
         outcome: preflight.status,
         reasonCodes: [...preflight.errors, ...preflight.warnings].map(({ code }) => code),
@@ -447,8 +516,11 @@ export default {
       return Response.json(result, {
         headers: {
           "X-MYReady-Operation-Id": operationId,
-          "X-MYReady-Chargeable": String(result.usage.chargeable),
-          "X-MYReady-Unit-Price": "MYR 0.01",
+          "X-MYReady-Simulated-Value-Eligible": String(result.usage.simulated_value_eligible),
+          "X-MYReady-Simulated-Unit-Value": "MYR 0.01",
+          "X-RateLimit-Limit": String(authorization.limit),
+          "X-RateLimit-Remaining": String(authorization.remaining),
+          "Cache-Control": "no-store",
         },
       });
     }
@@ -473,13 +545,11 @@ export default {
     if (!isValidIdempotencyKey(idempotencyKey)) {
       return Response.json({ error: "invalid_idempotency_key" }, { status: 400 });
     }
-    const clientId = pilotClientId(request);
-    if (clientId === null) return Response.json({ error: "invalid_pilot_client_id" }, { status: 400 });
     const operationId = await createOperationId(body.text, idempotencyKey);
     const result = attachUsage(resolveMalaysia(body.text), operationId, idempotencyKey !== null);
-    result.usage = await recordChargeableOperation(env, result.usage);
+    result.usage = await recordSimulatedValueOperation(env, result.usage);
     await recordPilotEvent(env, {
-      pilotClientId: clientId,
+      pilotClientId: "unattributed",
       endpoint: "/v1/malaysia/resolve",
       outcome: result.machine_ready ? "ready" : "rejected",
       reasonCodes: Object.keys(result.ambiguities || {}).map((name) => `ambiguous_${name}`),
@@ -489,8 +559,8 @@ export default {
     return Response.json(result, {
       headers: {
         "X-MYReady-Operation-Id": operationId,
-        "X-MYReady-Chargeable": String(result.usage.chargeable),
-        "X-MYReady-Unit-Price": "MYR 0.01",
+        "X-MYReady-Simulated-Value-Eligible": String(result.usage.simulated_value_eligible),
+        "X-MYReady-Simulated-Unit-Value": "MYR 0.01",
       },
     });
   },

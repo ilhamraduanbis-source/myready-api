@@ -2,6 +2,51 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker, { preflightMyInvois, resolveMalaysia } from "../src/index.js";
 
+const PILOT_TOKEN = "myr_pilot_0123456789abcdef0123456789abcdef";
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function pilotEnvironment(options = {}) {
+  const statements = [];
+  const state = {
+    tokenHash: await sha256Hex(PILOT_TOKEN),
+    status: options.status || "active",
+    rateLimit: options.rateLimit || 60,
+    requestCount: options.requestCount || 0,
+    operationChanges: options.operationChanges ?? 1,
+  };
+  const LEDGER = {
+    prepare(sql) {
+      const statement = { sql, values: [] };
+      statements.push(statement);
+      return {
+        bind(...values) { statement.values = values; return this; },
+        async run() {
+          if (sql.includes("INSERT INTO pilot_rate_limits")) state.requestCount += 1;
+          return { meta: { changes: sql.includes("INSERT OR IGNORE INTO operations") ? state.operationChanges : 1 } };
+        },
+        async first() {
+          if (sql.includes("FROM pilot_participants")) {
+            const [candidateHash] = statement.values;
+            if (candidateHash !== state.tokenHash || state.status !== "active") return null;
+            return { participant_id: "pilot-alpha", rate_limit_per_minute: state.rateLimit };
+          }
+          if (sql.includes("FROM pilot_rate_limits")) return { request_count: state.requestCount };
+          return null;
+        },
+      };
+    },
+  };
+  return { LEDGER, statements, state };
+}
+
+function pilotHeaders(extra = {}) {
+  return { "content-type": "application/json", Authorization: `Bearer ${PILOT_TOKEN}`, ...extra };
+}
+
 function validInvoice() {
   const address = { line: "1 Jalan Ampang", city: "Kuala Lumpur", postcode: "50450", state_code: "14", country_code: "MYS" };
   return {
@@ -146,69 +191,66 @@ test("MyInvois preflight rejects invented classification codes", () => {
   assert.equal(result.errors[0].path, "lines[0].classification_code");
 });
 
-test("MyInvois preflight endpoint charges only locally ready documents", async () => {
+test("MyInvois preflight records simulated value only for locally ready documents", async () => {
+  const env = await pilotEnvironment();
   const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
     method: "POST",
-    headers: { "content-type": "application/json", "Idempotency-Key": "preflight-1" },
+    headers: pilotHeaders({ "Idempotency-Key": "preflight-1" }),
     body: JSON.stringify({ document: validInvoice() }),
-  }));
+  }), env);
   const body = await response.json();
   assert.equal(response.status, 200);
   assert.equal(body.machine_ready, true);
   assert.equal(body.status, "needs_review");
-  assert.equal(body.usage.chargeable, true);
-  assert.equal(response.headers.get("X-MYReady-Unit-Price"), "MYR 0.01");
+  assert.equal(body.usage.simulated_value_eligible, true);
+  assert.equal(body.usage.chargeable, undefined);
+  assert.equal(response.headers.get("X-MYReady-Simulated-Unit-Value"), "MYR 0.01");
 
   const invalid = validInvoice();
   invalid.totals.total = 999;
   const rejected = await (await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ document: invalid }),
-  }))).json();
-  assert.equal(rejected.usage.chargeable, false);
+    method: "POST", headers: pilotHeaders(), body: JSON.stringify({ document: invalid }),
+  }), env)).json();
+  assert.equal(rejected.usage.simulated_value_eligible, false);
 });
 
-test("MyInvois preflight ledger stores endpoint but not invoice contents", async () => {
-  const statements = [];
-  const LEDGER = {
-    prepare(sql) {
-      const statement = { sql, values: [] };
-      statements.push(statement);
-      return { bind(...values) { statement.values = values; return this; }, async run() { return { meta: { changes: 1 } }; } };
-    },
-  };
+test("MyInvois preflight ledger stores endpoint but not invoice contents or token", async () => {
+  const env = await pilotEnvironment();
   const invoice = validInvoice();
   invoice.invoice_number = "PRIVATE-INVOICE-SECRET";
   const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
-    method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "preflight-ledger" }, body: JSON.stringify({ document: invoice }),
-  }), { LEDGER });
+    method: "POST", headers: pilotHeaders({ "Idempotency-Key": "preflight-ledger" }), body: JSON.stringify({ document: invoice }),
+  }), env);
   const body = await response.json();
-  assert.equal(body.usage.charge_status, "recorded_not_collected");
+  assert.equal(body.usage.simulated_value_status, "recorded_simulation_only");
   assert.equal(body.usage.economic_mode, "simulated_value_only");
   assert.equal(body.usage.cash_collected, false);
-  assert.equal(JSON.stringify(statements).includes("/v1/myinvois/preflight"), true);
-  assert.equal(JSON.stringify(statements).includes("PRIVATE-INVOICE-SECRET"), false);
+  assert.equal(JSON.stringify(env.statements).includes("/v1/myinvois/preflight"), true);
+  assert.equal(JSON.stringify(env.statements).includes("PRIVATE-INVOICE-SECRET"), false);
+  assert.equal(JSON.stringify(env.statements).includes(PILOT_TOKEN), false);
 });
 
 test("MyInvois preflight rejects oversized payloads", async () => {
+  const env = await pilotEnvironment();
   const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ document: { note: "x".repeat(100_001) } }),
-  }));
+    method: "POST", headers: pilotHeaders(), body: JSON.stringify({ document: { note: "x".repeat(100_001) } }),
+  }), env);
   assert.equal(response.status, 413);
   assert.deepEqual(await response.json(), { error: "payload_too_large" });
 });
 
-test("successful operations expose the explicit one-cent unit price", async () => {
+test("successful operations expose explicit simulated one-cent value", async () => {
   const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
     method: "POST",
     headers: { "content-type": "application/json", "Idempotency-Key": "invoice-123" },
     body: JSON.stringify({ text: "Jumlah RM10 di Selangor" }),
   }));
   const body = await response.json();
-  assert.equal(body.usage.chargeable, true);
-  assert.equal(body.usage.charge_status, "not_collected");
-  assert.deepEqual(body.usage.unit_price, { currency: "MYR", amount_minor: 1, amount: 0.01 });
+  assert.equal(body.usage.simulated_value_eligible, true);
+  assert.equal(body.usage.simulated_value_status, "not_recorded");
+  assert.deepEqual(body.usage.simulated_unit_value, { currency: "MYR", amount_minor: 1, amount: 0.01 });
   assert.equal(body.usage.idempotent, true);
-  assert.equal(response.headers.get("X-MYReady-Unit-Price"), "MYR 0.01");
+  assert.equal(response.headers.get("X-MYReady-Simulated-Unit-Value"), "MYR 0.01");
 });
 
 test("the same idempotency key and input produce the same operation id", async () => {
@@ -222,14 +264,14 @@ test("the same idempotency key and input produce the same operation id", async (
   assert.equal(first.usage.operation_id, second.usage.operation_id);
 });
 
-test("ambiguous operations are not chargeable", async () => {
+test("ambiguous operations are not eligible for simulated value", async () => {
   const response = await worker.fetch(new Request("https://example.test/v1/malaysia/resolve", {
     method: "POST",
     headers: { "content-type": "application/json", "Idempotency-Key": "ambiguous-1" },
     body: JSON.stringify({ text: "RM10 atau RM20" }),
   }));
   const body = await response.json();
-  assert.equal(body.usage.chargeable, false);
+  assert.equal(body.usage.simulated_value_eligible, false);
 });
 
 test("invalid idempotency keys are rejected", async () => {
@@ -242,7 +284,7 @@ test("invalid idempotency keys are rejected", async () => {
   assert.deepEqual(await response.json(), { error: "invalid_idempotency_key" });
 });
 
-test("chargeable operations are recorded without storing source text", async () => {
+test("simulated-value operations are recorded without storing source text", async () => {
   const statements = [];
   const LEDGER = {
     prepare(sql) {
@@ -265,42 +307,65 @@ test("chargeable operations are recorded without storing source text", async () 
     body: JSON.stringify({ text: "Sensitive invoice text RM10" }),
   }), { LEDGER });
   const body = await response.json();
-  assert.equal(body.usage.charge_status, "recorded_not_collected");
+  assert.equal(body.usage.simulated_value_status, "recorded_simulation_only");
   assert.deepEqual(body.usage.ledger, { recorded: true, duplicate: false });
   assert.equal(statements.length, 4);
   assert.equal(JSON.stringify(statements).includes("Sensitive invoice text"), false);
 });
 
 test("pilot telemetry stores aggregate categories without request contents", async () => {
-  const statements = [];
-  const LEDGER = {
-    prepare(sql) {
-      const statement = { sql, values: [] };
-      statements.push(statement);
-      return { bind(...values) { statement.values = values; return this; }, async run() { return { meta: { changes: sql.includes("INSERT OR IGNORE") ? 1 : 0 } }; } };
-    },
-  };
+  const env = await pilotEnvironment();
   const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
     method: "POST",
-    headers: { "content-type": "application/json", "Idempotency-Key": "pilot-metrics-1", "X-MYReady-Pilot-Client": "pilot-alpha" },
+    headers: pilotHeaders({ "Idempotency-Key": "pilot-metrics-1" }),
     body: JSON.stringify({ document: validInvoice() }),
-  }), { LEDGER });
+  }), env);
   assert.equal(response.status, 200);
-  const serialized = JSON.stringify(statements);
+  const serialized = JSON.stringify(env.statements);
   assert.equal(serialized.includes("pilot-alpha"), true);
   assert.equal(serialized.includes("not_authoritatively_verified"), true);
   assert.equal(serialized.includes("Supplier Sdn Bhd"), false);
   assert.equal(serialized.includes("202601234567"), false);
 });
 
-test("invalid pilot client identifiers are rejected", async () => {
+test("missing, malformed, unknown and revoked pilot tokens use one generic rejection", async () => {
+  for (const authorization of [undefined, "Bearer malformed", "Bearer myr_pilot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) {
+    const env = await pilotEnvironment();
+    const headers = { "content-type": "application/json" };
+    if (authorization) headers.Authorization = authorization;
+    const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
+      method: "POST", headers, body: JSON.stringify({ document: validInvoice() }),
+    }), env);
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: "invalid_pilot_token" });
+  }
+  const revoked = await pilotEnvironment({ status: "revoked" });
   const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
-    method: "POST",
-    headers: { "content-type": "application/json", "X-MYReady-Pilot-Client": "contains spaces" },
-    body: JSON.stringify({ document: validInvoice() }),
-  }));
-  assert.equal(response.status, 400);
-  assert.deepEqual(await response.json(), { error: "invalid_pilot_client_id" });
+    method: "POST", headers: pilotHeaders(), body: JSON.stringify({ document: validInvoice() }),
+  }), revoked);
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "invalid_pilot_token" });
+});
+
+test("pilot rate limit is isolated per participant and returns retry guidance", async () => {
+  const env = await pilotEnvironment({ rateLimit: 2, requestCount: 2 });
+  const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
+    method: "POST", headers: pilotHeaders(), body: JSON.stringify({ document: validInvoice() }),
+  }), env);
+  assert.equal(response.status, 429);
+  assert.deepEqual(await response.json(), { error: "rate_limit_exceeded" });
+  assert.equal(Number(response.headers.get("Retry-After")) > 0, true);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+});
+
+test("pilot authentication fails closed when its datastore is unavailable", async () => {
+  const LEDGER = { prepare() { throw new Error("database unavailable"); } };
+  const response = await worker.fetch(new Request("https://example.test/v1/myinvois/preflight", {
+    method: "POST", headers: pilotHeaders(), body: JSON.stringify({ document: validInvoice() }),
+  }), { LEDGER });
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "pilot_authentication_unavailable" });
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
 });
 
 test("ledger identifies an already-recorded operation", async () => {

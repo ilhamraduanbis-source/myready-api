@@ -7,6 +7,8 @@ MYReady is testing whether a lightweight Malaysia-specific preflight can reduce 
 - Up to 3 Malaysian software or ERP integration teams
 - 30 days of free API access
 - No billing and no payment details
+- One separate revocable access token per team
+- A default limit of 60 authenticated requests per minute per team
 - Direct feedback loop on missing or unhelpful checks
 - Local pre-submission checks only; no submission to HASiL
 
@@ -36,6 +38,8 @@ MYReady is a local developer preflight. It is not an official HASiL service, doe
 - join a short written feedback check at the end.
 
 The API does not store invoice text, TINs, identity numbers, addresses or customer details in its pilot telemetry.
+
+MYReady does not request, use or store a participant's MyInvois credentials. Participants must keep their MYReady pilot token out of source control and logs. Tokens are stored by MYReady only as SHA-256 hashes and can be revoked without changing another participant's access.
 
 ## Success test
 

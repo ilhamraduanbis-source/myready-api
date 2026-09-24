@@ -16,12 +16,13 @@ Pilot telemetry stores only:
 - endpoint;
 - outcome category;
 - reason-code categories;
-- chargeable, duplicate and idempotent flags;
+- simulated-value eligibility, duplicate and idempotent flags;
 - simulated amount in minor units;
 - latency;
 - timestamp.
 
 It does not store request bodies, invoice numbers, TINs, identity numbers, names, addresses or line descriptions.
+It also does not store plaintext pilot tokens or MyInvois credentials.
 
 ## Metrics
 
@@ -47,6 +48,7 @@ It does not store request bodies, invoice numbers, TINs, identity numbers, names
 - Separate manual curl testing from workflow integration.
 - Do not call a team “integrated” until MYReady is invoked from their software or automated test suite.
 - Do not infer willingness to pay from free usage.
+- Exclude unauthenticated and rate-limited attempts from product-usage evidence.
 
 ## Pilot decision after 30 days
 

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: MYReady API
-  version: 1.0.1
+  version: 1.0.2
   description: Local Malaysian data preflight. Not an official HASiL or MyInvois service.
 servers:
   - url: https://myready-api.ilhamraduan-bis.workers.dev
@@ -17,18 +17,18 @@ paths:
       summary: Run local MyInvois-oriented preflight checks
       parameters:
         - in: header
+          name: Authorization
+          required: true
+          description: Revocable participant token using `Bearer myr_pilot_...`. Never log or commit it.
+          schema:
+            type: string
+            pattern: "^Bearer myr_pilot_[A-Za-z0-9_-]{32,128}$"
+        - in: header
           name: Idempotency-Key
           required: true
           schema:
             type: string
             pattern: "^[A-Za-z0-9._:-]{1,128}$"
-        - in: header
-          name: X-MYReady-Pilot-Client
-          required: false
-          description: Opaque identifier assigned to a pilot team.
-          schema:
-            type: string
-            pattern: "^[A-Za-z0-9._:-]{1,64}$"
       requestBody:
         required: true
         content:
@@ -48,6 +48,10 @@ paths:
                 $ref: "#/components/schemas/PreflightResult"
         "400":
           description: Invalid JSON or header
+        "401":
+          description: Missing, invalid or revoked pilot token
+        "429":
+          description: Per-participant request limit exceeded; inspect Retry-After
         "413":
           description: Payload exceeds 100 KB
 components:
@@ -144,6 +148,13 @@ components:
           properties:
             operation_id: { type: string }
             idempotent: { type: boolean }
-            chargeable: { type: boolean, description: Qualifies for simulated value; not a real charge during pilot. }
+            simulated_value_eligible: { type: boolean, description: Qualifies for the RM0.01 economic simulation; never a real charge during pilot. }
+            simulated_unit_value:
+              type: object
+              properties:
+                currency: { const: MYR }
+                amount_minor: { const: 1 }
+                amount: { const: 0.01 }
+            simulated_value_status: { type: string, enum: [not_recorded, recorded_simulation_only] }
             economic_mode: { const: simulated_value_only }
             cash_collected: { const: false }

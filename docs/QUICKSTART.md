@@ -4,13 +4,13 @@ Base URL: `https://myready-api.ilhamraduan-bis.workers.dev`
 
 Endpoint: `POST /v1/myinvois/preflight`
 
-Send JSON with an `Idempotency-Key`. Pilot teams will also receive an opaque `X-MYReady-Pilot-Client` identifier for aggregate measurement.
+Each pilot team receives one revocable bearer token. Send it in `Authorization` together with an `Idempotency-Key`. Keep the token in a secret manager or environment variable; do not commit it, paste it into tickets or log it.
 
 ```bash
 curl -X POST "https://myready-api.ilhamraduan-bis.workers.dev/v1/myinvois/preflight" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MYREADY_PILOT_TOKEN" \
   -H "Idempotency-Key: demo-invoice-1001" \
-  -H "X-MYReady-Pilot-Client: assigned-pilot-id" \
   --data '{
     "document": {
       "e_invoice_version": "1.0",
@@ -65,7 +65,8 @@ curl -X POST "https://myready-api.ilhamraduan-bis.workers.dev/v1/myinvois/prefli
 - `status: needs_review` means no local blocking error was found but an authoritative check, such as TIN/identity pairing, is still required.
 - `status: rejected` means `errors` contains blocking issues with machine-readable `path` and `code` values.
 - `validation_scope` always states that this is not authoritative MyInvois validation.
-- `usage.economic_mode` is `simulated_value_only`. No money is collected during the pilot.
+- `usage.simulated_value_eligible` states whether the operation contributes RM0.01 to the economic simulation.
+- `usage.economic_mode` is `simulated_value_only` and `usage.cash_collected` is always `false`. No money is collected during the pilot.
 
 Example blocking error:
 
@@ -85,8 +86,14 @@ Reuse the same `Idempotency-Key` only for the same logical request. The first lo
 
 - Maximum request size: 100 KB
 - Idempotency key: 1–128 letters, digits, `.`, `_`, `:` or `-`
-- Pilot client ID: assigned opaque identifier, maximum 64 characters
+- Default participant limit: 60 authenticated requests per minute
 - Do not send production personal data during evaluation
+
+## Authentication errors
+
+- Missing, malformed, unknown and revoked tokens all return HTTP `401` with `invalid_pilot_token`.
+- Exceeding the participant limit returns HTTP `429` with `rate_limit_exceeded` and a `Retry-After` header.
+- Contact the pilot administrator if a token may have been exposed. It will be revoked and replaced; MYReady never needs MyInvois credentials.
 
 ## Not included
 

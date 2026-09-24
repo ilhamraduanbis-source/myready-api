@@ -1,0 +1,27 @@
+{
+  "document": {
+    "e_invoice_version": "1.0",
+    "document_type_code": "01",
+    "invoice_number": "SYNTHETIC-CI-001",
+    "issue_date": "2026-09-24",
+    "issue_time": "05:00:00Z",
+    "currency": "MYR",
+    "payment_mode": "03",
+    "supplier": {
+      "tin": "C1234567890",
+      "id_type": "BRN",
+      "id_value": "202601234567",
+      "name": "Synthetic Supplier",
+      "address": { "line": "1 Jalan Contoh", "city": "Kuala Lumpur", "postcode": "50450", "state_code": "14", "country_code": "MYS" }
+    },
+    "buyer": {
+      "tin": "C0987654321",
+      "id_type": "BRN",
+      "id_value": "202609876543",
+      "name": "Synthetic Buyer",
+      "address": { "line": "2 Jalan Contoh", "city": "Kuala Lumpur", "postcode": "50450", "state_code": "14", "country_code": "MYS" }
+    },
+    "lines": [{ "description": "Synthetic test", "classification_code": "022", "tax_type": "06", "quantity": 2, "unit_price": 50, "line_total": 100 }],
+    "totals": { "subtotal": 100, "tax": 0, "total": 100 }
+  }
+}
