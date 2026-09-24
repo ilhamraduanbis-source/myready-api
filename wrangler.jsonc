@@ -1,5 +1,10 @@
 {
   "name": "myready-api",
   "main": "src/index.js",
-  "compatibility_date": "2026-09-22"
+  "compatibility_date": "2026-09-22",
+  "d1_databases": [
+    {
+      "binding": "LEDGER"
+    }
+  ]
 }
