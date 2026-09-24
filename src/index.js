@@ -1,3 +1,9 @@
+import {
+  authorizeSandbox, duplicateFingerprint, executeAddressResolution, issueSandboxToken,
+  obviousAutomationNoise, recordSandboxEvent, revokeSandboxToken, sandboxFingerprint,
+} from "./sandbox.js";
+import addressSandboxOpenApi from "../docs/address-sandbox-openapi.json" with { type: "json" };
+
 const VERSION = "1.0";
 const SIMULATED_UNIT_VALUE = Object.freeze({ currency: "MYR", amount_minor: 1, amount: 0.01 });
 const DEFAULT_PILOT_RATE_LIMIT = 60;
@@ -478,6 +484,105 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ ok: true, service: "MYReady", version: VERSION });
     }
+    if (request.method === "GET" && url.pathname === "/openapi/address-sandbox.json") {
+      return Response.json(addressSandboxOpenApi, { headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=300",
+      } });
+    }
+    if (request.method === "POST" && url.pathname === "/sandbox/v1/access") {
+      let issued;
+      try {
+        issued = await issueSandboxToken(request, env);
+      } catch {
+        issued = { ok: false, status: 503, error: "sandbox_access_unavailable" };
+      }
+      if (!issued.ok) return Response.json({ error: issued.error }, { status: issued.status, headers: { "Cache-Control": "no-store" } });
+      return Response.json({
+        token: issued.token,
+        token_type: "Bearer",
+        expires_at: issued.expiresAt,
+        scope: "sandbox:address:resolve",
+        rate_limit_per_minute: issued.limit,
+        commercial_relationship: false,
+        billing_enabled: false,
+      }, { status: 201, headers: { "Cache-Control": "no-store" } });
+    }
+    if (request.method === "DELETE" && url.pathname === "/sandbox/v1/access") {
+      let revoked;
+      try {
+        revoked = await revokeSandboxToken(request, env);
+      } catch {
+        revoked = { ok: false, status: 503, error: "sandbox_access_unavailable" };
+      }
+      if (!revoked.ok) return Response.json({ error: revoked.error }, { status: revoked.status, headers: { "Cache-Control": "no-store" } });
+      return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+    }
+    if (request.method === "POST" && url.pathname === "/sandbox/v1/address/resolve") {
+      let authorization;
+      try {
+        authorization = await authorizeSandbox(request, env);
+      } catch {
+        return Response.json({ error: "sandbox_authentication_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+      }
+      if (!authorization.ok) {
+        const headers = { "Cache-Control": "no-store" };
+        if (authorization.retryAfter) headers["Retry-After"] = String(authorization.retryAfter);
+        return Response.json({ error: authorization.error }, { status: authorization.status, headers });
+      }
+      const declaredLength = Number(request.headers.get("content-length") || 0);
+      if (declaredLength > 10_000) return Response.json({ error: "payload_too_large" }, { status: 413 });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "invalid_json" }, { status: 400 });
+      }
+      if (!isObject(body) || typeof body.address !== "string" || body.address.trim().length < 4) {
+        return Response.json({ error: "address_required" }, { status: 422 });
+      }
+      if (Object.keys(body).some((field) => !["address", "postcode", "locality", "state"].includes(field))) {
+        return Response.json({ error: "unknown_field" }, { status: 422 });
+      }
+      if (body.address.length > 500) return Response.json({ error: "address_too_long" }, { status: 413 });
+      for (const field of ["postcode", "locality", "state"]) {
+        if (body[field] !== undefined && typeof body[field] !== "string") return Response.json({ error: `invalid_${field}` }, { status: 422 });
+        if (typeof body[field] === "string" && body[field].length > 100) return Response.json({ error: `${field}_too_long` }, { status: 413 });
+      }
+      const idempotencyKey = request.headers.get("Idempotency-Key");
+      if (!idempotencyKey || !isValidIdempotencyKey(idempotencyKey)) return Response.json({ error: "valid_idempotency_key_required" }, { status: 400 });
+
+      const resolution = executeAddressResolution(body);
+      const fingerprint = await sandboxFingerprint(env, authorization, body);
+      const duplicate = await duplicateFingerprint(env, authorization, fingerprint);
+      const noise = obviousAutomationNoise(request);
+      const fieldCount = [body.address, body.postcode, body.locality, body.state].filter((value) => typeof value === "string" && value.trim()).length;
+      const postcodeOnly = fieldCount === 1 && /^\s*\d{5}\s*$/.test(body.address);
+      const meaningful = resolution.meaningful_resolution;
+      const qualified = !authorization.isInternal && !duplicate && !noise && !postcodeOnly && meaningful;
+      await recordSandboxEvent(env, {
+        tokenId: authorization.tokenId, isInternal: authorization.isInternal, outcome: resolution.status,
+        qualified, duplicate, noise, fingerprint, fieldCount, hasAddress: true,
+        hasPostcode: Boolean(body.postcode || /(?<!\d)\d{5}(?!\d)/.test(body.address)),
+        meaningful, ambiguity: resolution.status === "ambiguous", conflict: resolution.status === "conflict",
+        latencyMs: performance.now() - startedAt,
+      });
+      return Response.json({
+        ...resolution,
+        experiment: {
+          economic_mode: "free_bounded_validation",
+          billing_enabled: false,
+          observation_qualified: qualified,
+          duplicate,
+          dataset_version: resolution.provenance.version,
+        },
+      }, { headers: {
+        "Cache-Control": "no-store",
+        "X-RateLimit-Limit": String(authorization.limit),
+        "X-RateLimit-Remaining": String(authorization.remaining),
+        "X-MYReady-Observation-Qualified": String(qualified),
+      } });
+    }
     if (request.method === "POST" && url.pathname === "/v1/myinvois/preflight") {
       let authorization;
       try {
@@ -527,7 +632,11 @@ export default {
     if (request.method !== "POST" || url.pathname !== "/v1/malaysia/resolve") {
       return Response.json({
         service: "MYReady", version: VERSION, status: "online",
-        endpoints: { health: "GET /health", resolve: "POST /v1/malaysia/resolve", preflight: "POST /v1/myinvois/preflight" },
+        endpoints: {
+          health: "GET /health", resolve: "POST /v1/malaysia/resolve",
+          preflight: "POST /v1/myinvois/preflight", sandbox_access: "POST /sandbox/v1/access",
+          address_resolver: "POST /sandbox/v1/address/resolve",
+        },
       }, { status: 404 });
     }
 

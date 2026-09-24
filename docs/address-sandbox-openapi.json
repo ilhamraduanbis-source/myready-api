@@ -1,0 +1,108 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "MYReady Malaysian Address Resolver Sandbox",
+    "version": "1.0.0-experiment",
+    "description": "Free, bounded experimental API for deterministic Malaysian postcode, locality and state resolution. It normalises selected address abbreviations and reports ambiguity or conflicts instead of guessing. It does not prove that an address exists or is deliverable, and it is not a government service."
+  },
+  "servers": [{ "url": "https://myready-api.ilhamraduan-bis.workers.dev" }],
+  "paths": {
+    "/sandbox/v1/access": {
+      "post": {
+        "summary": "Issue an anonymous sandbox token",
+        "description": "No account or personal information is required. The token is valid only for the address sandbox, expires after 90 days, is revocable, and is not a billing credential.",
+        "operationId": "issueAddressSandboxToken",
+        "responses": {
+          "201": {
+            "description": "Anonymous sandbox token issued",
+            "headers": { "Cache-Control": { "schema": { "type": "string" } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AccessResponse" } } }
+          },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Revoke the current sandbox token",
+        "operationId": "revokeAddressSandboxToken",
+        "security": [{ "sandboxBearer": [] }],
+        "responses": {
+          "204": { "description": "Token revoked" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/sandbox/v1/address/resolve": {
+      "post": {
+        "summary": "Resolve Malaysian address context",
+        "description": "Returns deterministic structured context from an official Malaysian postcode reference snapshot. Send synthetic or de-identified data only. A unique Idempotency-Key is required; repeated equivalent input is identified without retaining the raw address.",
+        "operationId": "resolveMalaysianAddress",
+        "security": [{ "sandboxBearer": [] }],
+        "parameters": [{
+          "name": "Idempotency-Key", "in": "header", "required": true,
+          "schema": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" }
+        }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddressRequest" }, "examples": {
+            "normalisation": { "value": { "address": "5 Jln Ampang, Tmn Ampang, 55000 Kuala Lumpur" } },
+            "conflict": { "value": { "address": "5 Jalan Ampang, 55000 KL, Selangor" } }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Resolution result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ResolutionResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": { "sandboxBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "myr_sandbox_…" } },
+    "responses": { "Error": { "description": "Error response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } },
+    "schemas": {
+      "Error": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } },
+      "AccessResponse": {
+        "type": "object", "required": ["token", "token_type", "expires_at", "scope", "rate_limit_per_minute", "commercial_relationship", "billing_enabled"],
+        "properties": {
+          "token": { "type": "string", "writeOnly": true }, "token_type": { "const": "Bearer" },
+          "expires_at": { "type": "string", "format": "date-time" }, "scope": { "const": "sandbox:address:resolve" },
+          "rate_limit_per_minute": { "type": "integer" }, "commercial_relationship": { "const": false }, "billing_enabled": { "const": false }
+        }
+      },
+      "AddressRequest": {
+        "type": "object", "additionalProperties": false, "required": ["address"],
+        "properties": {
+          "address": { "type": "string", "minLength": 4, "maxLength": 500 },
+          "postcode": { "type": "string", "maxLength": 100 }, "locality": { "type": "string", "maxLength": 100 },
+          "state": { "type": "string", "maxLength": 100 }
+        }
+      },
+      "Candidate": {
+        "type": "object", "required": ["postcode", "state", "state_code", "locality"],
+        "properties": { "postcode": { "type": "string" }, "state": { "type": "string" }, "state_code": { "type": ["string", "null"] }, "locality": { "type": "string" } }
+      },
+      "ResolutionResponse": {
+        "type": "object", "required": ["status", "machine_ready", "normalised", "candidates", "normalisations", "conflicts", "ambiguities", "provenance", "experiment"],
+        "properties": {
+          "status": { "enum": ["resolved", "ambiguous", "conflict", "unknown"] }, "machine_ready": { "type": "boolean" },
+          "normalised": { "type": "object" }, "candidates": { "type": "array", "items": { "$ref": "#/components/schemas/Candidate" } },
+          "normalisations": { "type": "array", "items": { "type": "string" } }, "conflicts": { "type": "array", "items": { "type": "object" } },
+          "ambiguities": { "type": "array", "items": { "type": "object" } }, "reason": { "type": ["string", "null"] },
+          "meaningful_resolution": { "type": "boolean" }, "provenance": { "type": "object" }, "disclaimer": { "type": "string" },
+          "experiment": {
+            "type": "object", "required": ["economic_mode", "billing_enabled", "observation_qualified", "duplicate", "dataset_version"],
+            "properties": { "economic_mode": { "const": "free_bounded_validation" }, "billing_enabled": { "const": false },
+              "observation_qualified": { "type": "boolean" }, "duplicate": { "type": "boolean" }, "dataset_version": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

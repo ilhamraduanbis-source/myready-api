@@ -17,10 +17,15 @@ jobs:
       - name: Generate temporary masked smoke-test token
         run: |
           PILOT_TOKEN="myr_pilot_$(openssl rand -hex 32)"
+          SANDBOX_TOKEN="myr_sandbox_$(openssl rand -hex 24)"
           echo "::add-mask::$PILOT_TOKEN"
+          echo "::add-mask::$SANDBOX_TOKEN"
           PILOT_TOKEN_HASH="$(printf '%s' "$PILOT_TOKEN" | sha256sum | cut -d' ' -f1)"
+          SANDBOX_TOKEN_HASH="$(printf '%s' "$SANDBOX_TOKEN" | sha256sum | cut -d' ' -f1)"
           echo "PILOT_TOKEN=$PILOT_TOKEN" >> "$GITHUB_ENV"
           echo "PILOT_TOKEN_HASH=$PILOT_TOKEN_HASH" >> "$GITHUB_ENV"
+          echo "SANDBOX_TOKEN=$SANDBOX_TOKEN" >> "$GITHUB_ENV"
+          echo "SANDBOX_TOKEN_HASH=$SANDBOX_TOKEN_HASH" >> "$GITHUB_ENV"
       - name: Apply pilot security schema
         uses: cloudflare/wrangler-action@v4
         with:
@@ -37,6 +42,23 @@ jobs:
             "INSERT OR REPLACE INTO pilot_participants
             (participant_id, token_hash, status, rate_limit_per_minute, created_at, revoked_at)
             VALUES ('internal-readiness', '${{ env.PILOT_TOKEN_HASH }}', 'active', 10, datetime('now'), NULL)"
+      - name: Apply address sandbox schema
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute myready-api-ledger --remote --file=migrations/0003_address_sandbox.sql
+      - name: Provision internal address smoke-test token
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >-
+            d1 execute myready-api-ledger --remote --command
+            "INSERT OR REPLACE INTO sandbox_tokens
+            (token_id, token_hash, status, is_internal, rate_limit_per_minute, created_at, expires_at, revoked_at)
+            VALUES ('internal-readiness', '${{ env.SANDBOX_TOKEN_HASH }}', 'active', 1, 10,
+            datetime('now'), datetime('now', '+1 day'), NULL)"
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v4
         with:
@@ -54,6 +76,20 @@ jobs:
           printf '%s' "$RESPONSE" | jq -e \
             '.ready == true and .usage.economic_mode == "simulated_value_only" and .usage.cash_collected == false and .usage.simulated_value_eligible == true and (.usage | has("chargeable") | not)' \
             >/dev/null
+      - name: Verify public OpenAPI and internal address resolution
+        run: |
+          curl --fail-with-body --silent --show-error --max-time 20 \
+            'https://myready-api.ilhamraduan-bis.workers.dev/openapi/address-sandbox.json' \
+            | jq -e '.openapi == "3.1.0" and (.paths | has("/sandbox/v1/address/resolve"))' >/dev/null
+          RESPONSE="$(curl --fail-with-body --silent --show-error --max-time 20 \
+            -X POST 'https://myready-api.ilhamraduan-bis.workers.dev/sandbox/v1/address/resolve' \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $SANDBOX_TOKEN" \
+            -H 'Idempotency-Key: ci-address-readiness' \
+            --data '{"address":"5 Jln Ampang, Tmn Ampang, 55000 Kuala Lumpur"}')"
+          printf '%s' "$RESPONSE" | jq -e \
+            '.status == "resolved" and .machine_ready == true and .experiment.billing_enabled == false and .experiment.observation_qualified == false' \
+            >/dev/null
       - name: Revoke temporary smoke-test participant
         if: always()
         uses: cloudflare/wrangler-action@v4
@@ -64,3 +100,13 @@ jobs:
             d1 execute myready-api-ledger --remote --command
             "UPDATE pilot_participants SET status = 'revoked', revoked_at = datetime('now')
             WHERE participant_id = 'internal-readiness' AND token_hash = '${{ env.PILOT_TOKEN_HASH }}'"
+      - name: Revoke internal address smoke-test token
+        if: always()
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >-
+            d1 execute myready-api-ledger --remote --command
+            "UPDATE sandbox_tokens SET status = 'revoked', revoked_at = datetime('now')
+            WHERE token_id = 'internal-readiness' AND token_hash = '${{ env.SANDBOX_TOKEN_HASH }}'"

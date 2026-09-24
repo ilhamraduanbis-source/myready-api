@@ -6,6 +6,9 @@ Malaysia-specific data compatibility API proof of concept.
 - `GET /health`
 - `POST /v1/malaysia/resolve`
 - `POST /v1/myinvois/preflight`
+- `POST /sandbox/v1/access`
+- `POST /sandbox/v1/address/resolve`
+- `GET /openapi/address-sandbox.json`
 
 Current v1.0 normalizes selected Malaysian state, payment, document, phone, MYR amount, postcode candidate and SSM-format inputs. It reports ambiguous amounts and states rather than silently guessing. Validation against authoritative registries is intentionally not claimed.
 
@@ -28,3 +31,11 @@ Run the zero-dependency regression suite with `npm test`. Pushes to `main` run t
 - [OpenAPI 3.1 specification](docs/openapi.yaml)
 - [Privacy-safe measurement plan](docs/PILOT_MEASUREMENT.md)
 - [Pilot security operations](docs/PILOT_SECURITY.md)
+
+## Bounded address resolver experiment
+
+The separate [Malaysian Address Resolver Sandbox](docs/ADDRESS_SANDBOX.md) offers anonymous, self-service access to deterministic postcode/locality/state resolution, selected abbreviation normalisation, and explicit ambiguity/conflict detection. It uses privacy-minimising experiment telemetry, has no billing, and cannot access the MyInvois pilot.
+
+- [Address sandbox quick start](docs/ADDRESS_SANDBOX.md)
+- [Public OpenAPI 3.1 specification](docs/address-sandbox-openapi.json)
+- [Postcode dataset provenance](data/README.md)
